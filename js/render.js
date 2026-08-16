@@ -355,6 +355,56 @@
     oMat = vMatW * w;
   }`;
 
+  /* --- простой режим: SDF-стены и отдельные частицы ---------------- */
+  var FS_SIMPLE_SCENE = `#version 300 es
+  precision mediump float;
+  uniform sampler2D uSdf;
+  uniform vec2 uRes;
+  uniform float uPxPerM;
+  out vec4 o;
+  void main(){
+    vec2 uv = vec2(gl_FragCoord.x / uRes.x, 1.0 - gl_FragCoord.y / uRes.y);
+    float d = texture(uSdf, uv).r;
+    float edge = 1.5 / uPxPerM;
+    float wall = 1.0 - smoothstep(-edge, edge, d);
+    vec3 bg = vec3(0.025, 0.040, 0.065);
+    vec3 solid = vec3(0.24, 0.27, 0.32);
+    o = vec4(mix(bg, solid, wall), 1.0);
+  }`;
+
+  var VS_SIMPLE = `#version 300 es
+  in vec2 aCorner;
+  in vec2 aPos;
+  in float aMat;
+  uniform vec2 uRes;
+  uniform float uPxPerM;
+  uniform float uRadius;
+  out vec2 vLocal;
+  flat out float vMat;
+  void main(){
+    vec2 c = vec2(aPos.x * uPxPerM, uRes.y - aPos.y * uPxPerM);
+    gl_Position = vec4((c + aCorner * uRadius) / uRes * 2.0 - 1.0, 0.0, 1.0);
+    vLocal = aCorner;
+    vMat = aMat;
+  }`;
+
+  var FS_SIMPLE = `#version 300 es
+  precision mediump float;
+  in vec2 vLocal;
+  flat in float vMat;
+  out vec4 o;
+  void main(){
+    float r2 = dot(vLocal, vLocal);
+    if (r2 > 1.0) discard;
+    int m = int(vMat + 0.5);
+    vec3 c = vec3(0.12, 0.52, 0.95);
+    if (m == 1) c = vec3(0.78, 0.72, 0.18);
+    else if (m == 2) c = vec3(0.88, 0.42, 0.07);
+    else if (m == 3) c = vec3(0.72, 0.76, 0.82);
+    c *= 0.82 + 0.18 * (1.0 - r2);
+    o = vec4(c, 1.0);
+  }`;
+
   /* --- раздельное размытие ------------------------------------------ */
   /* Размываем оба поля разом: отсчёты берутся в одних и тех же точках,
      поэтому доли жидкостей сглаживаются согласованно с плотностью. */
@@ -856,6 +906,8 @@
 
     this.pScene = program(gl, VS_FULL, FS_SCENE, 'scene');
     this.pSplat = program(gl, VS_SPLAT, FS_SPLAT, 'splat');
+    this.pSimpleScene = program(gl, VS_FULL, FS_SIMPLE_SCENE, 'simple scene');
+    this.pSimple = program(gl, VS_SIMPLE, FS_SIMPLE, 'simple particles');
     this.pBlur = program(gl, VS_FULL, FS_BLUR, 'blur');
     this.pAbove = program(gl, VS_FULL, FS_ABOVE, 'above');
     this.pWater = program(gl, VS_FULL, FS_WATER, 'water');
@@ -907,6 +959,8 @@
     gl.bindBuffer(gl.ARRAY_BUFFER, this.splatBuf);
     gl.bufferData(gl.ARRAY_BUFFER, this.splatData.byteLength, gl.DYNAMIC_DRAW);
     this.splatVao = this.makeInstVao(this.pSplat, this.splatBuf, [
+      ['aPos', 2], ['aVel', 2], ['aFoam', 1], ['aMat', 1]], 6);
+    this.simpleVao = this.makeInstVao(this.pSimple, this.splatBuf, [
       ['aPos', 2], ['aVel', 2], ['aFoam', 1], ['aMat', 1]], 6);
 
     // diffuse: [x, y, type, life, size, mat]
@@ -997,6 +1051,40 @@
     else { gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, this.W, this.H); }
     gl.bindVertexArray(this.emptyVao);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+  };
+
+  Renderer.prototype.drawSimple = function (fluid) {
+    var gl = this.gl, W = this.W, H = this.H, u;
+
+    // Фон и стены: один отсчёт SDF на пиксель, без промежуточных буферов.
+    gl.useProgram(this.pSimpleScene);
+    u = this.pSimpleScene._u;
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.sdfTex);
+    gl.uniform1i(u.uSdf, 0);
+    gl.uniform2f(u.uRes, W, H);
+    gl.uniform1f(u.uPxPerM, this.pxPerM);
+    gl.disable(gl.BLEND);
+    this.fullscreen(null);
+
+    // Частицы рисуются прямо на экран плоскими цветными кружками.
+    var n = Math.min(fluid.n, this.maxParticles), d = this.splatData;
+    for (var i = 0, k = 0; i < n; i++) {
+      d[k++] = fluid.px[i]; d[k++] = fluid.py[i];
+      d[k++] = 0; d[k++] = 0; d[k++] = 0;
+      d[k++] = fluid.mat ? fluid.mat[i] : 0;
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.splatBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, d, 0, n * 6);
+    if (n > 0) {
+      gl.useProgram(this.pSimple);
+      u = this.pSimple._u;
+      gl.uniform2f(u.uRes, W, H);
+      gl.uniform1f(u.uPxPerM, this.pxPerM);
+      gl.uniform1f(u.uRadius, (fluid.dp || 0.05) * this.pxPerM * 0.62);
+      gl.bindVertexArray(this.simpleVao);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+    }
+    gl.bindVertexArray(null);
   };
 
   Renderer.prototype.draw = function (fluid, diffuse, p) {

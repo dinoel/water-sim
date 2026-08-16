@@ -39,7 +39,8 @@
   /* --- параметры, которые главный поток передаёт рабочим каждый шаг --- */
   var PARAMS = [
     'gravityX', 'gravityY', 'iterations', 'substeps', 'relax', 'sor',
-    'maxCorrection', 'tensionLimit', 'sCorrK', 'viscosity', 'vorticity',
+    'maxCorrection', 'tensionLimit', 'pipeTension', 'pipeFlow', 'pipeDrive', 'pipeDamping', 'sCorrK',
+    'viscosity', 'vorticity',
     'cohesion', 'curvature', 'adhesion', 'friction', 'foamRate',
     'maxSpeed', 'drag', 'buoyancy', 'ambientG', 'wetClimb'
   ];
@@ -244,6 +245,8 @@
     f.phaseForces2(i0, i1, dt);
     barrier(ctrl, nT);            // силы читают чужие v, а применение их пишет
     f.phaseForcesApply(i0, i1, dt);
+    barrier(ctrl, nT);
+    if (id === 0) f.projectPipeFlow(dt);
     barrier(ctrl, nT);
 
     if (times) {

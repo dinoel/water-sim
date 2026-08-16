@@ -199,7 +199,7 @@ console.log('\n[сообщающиеся сосуды: уровень вырав
   solid.rebuild();
   var f = new WS.Fluid({ width: W, height: H, spacing: 0.03, maxParticles: 9000, solid: solid });
   f.vorticity = 0.05;
-  f.fillRect(0.1, 0.6, 1.4, 2.4, 0.01);       // вода только слева
+  f.fillRect(0.1, 0.6, 1.4, 2.4, 0);          // вода только слева
   for (var s = 0; s < 900; s++) f.step(1 / 60);
   var lTop = 1e9, rTop = 1e9, lN = 0, rN = 0;
   for (var i = 0; i < f.n; i++) {
@@ -207,8 +207,75 @@ console.log('\n[сообщающиеся сосуды: уровень вырав
     else if (f.px[i] > 1.6) { rN++; if (f.py[i] < rTop) rTop = f.py[i]; }
   }
   ok('вода перетекла во второй сосуд', rN > f.n * 0.25, 'слева ' + lN + ', справа ' + rN);
-  ok('уровни сравнялись', Math.abs(lTop - rTop) < 0.15,
+  ok('уровни сравнялись с точностью до полутора рядов',
+     Math.abs(lTop - rTop) < f.dp * 1.5,
      'перепад ' + (Math.abs(lTop - rTop) * 100).toFixed(1) + ' см');
+})();
+
+/* ---------- 7b. длинная U-труба ------------------------------------ */
+console.log('\n[длинная U-труба: остаточный напор исчезает]');
+(function () {
+  var W = 8, H = 4.5, cell = 0.025, dp = 0.046875;
+  var solid = new SDF.Solid(Math.ceil(W / cell), Math.ceil(H / cell), cell);
+  solid.addBorder(3);
+  // Монолит с вырезанной полостью: два стакана, две шахты и длинная труба.
+  solid.paintRect(0.78, 0.45, 7.22, 4.02, 1);
+  solid.paintRect(1.00, 0.30, 2.40, 2.52, 0);
+  solid.paintRect(1.38, 2.30, 1.82, 3.80, 0);
+  solid.paintRect(1.38, 3.40, 6.62, 3.80, 0);
+  solid.paintRect(6.18, 2.30, 6.62, 3.80, 0);
+  solid.paintRect(5.60, 0.30, 7.00, 2.52, 0);
+  solid.rebuild();
+
+  var f = new WS.Fluid({ width: W, height: H, spacing: dp,
+                         maxParticles: 10000, solid: solid });
+  var dy = dp * Math.sqrt(3) / 2, row = 0;
+  for (var y = 0.5 + dp * 0.5; y < 3.78; y += dy, row++) {
+    var off = row % 2 ? dp * 0.5 : 0;
+    for (var x = 0.8 + dp * 0.5 + off; x < 7.2; x += dp) {
+      // Начальный уровень слева на 30 см выше; вся труба уже заполнена.
+      var left = x > 1.0 && x < 2.4 && y > 1.18 && y < 2.52;
+      var right = x > 5.6 && x < 7.0 && y > 1.48 && y < 2.52;
+      var ls = x > 1.38 && x < 1.82 && y > 2.30 && y < 3.80;
+      var rs = x > 6.18 && x < 6.62 && y > 2.30 && y < 3.80;
+      var pipe = x > 1.38 && x < 6.62 && y > 3.40 && y < 3.80;
+      if ((left || right || ls || rs || pipe) &&
+          solid.sample(x, y) > f.wallOffset) f.add(x, y, 0, 0, 0);
+    }
+  }
+
+  function surface(x0, x1) {
+    var bins = 12, tops = [];
+    for (var b = 0; b < bins; b++) {
+      var lo = x0 + (x1 - x0) * b / bins;
+      var hi = x0 + (x1 - x0) * (b + 1) / bins;
+      var ys = [];
+      for (var i = 0; i < f.n; i++)
+        if (f.px[i] >= lo && f.px[i] < hi && f.py[i] < 2.55) ys.push(f.py[i]);
+      if (ys.length > 5) {
+        ys.sort(function (a, b) { return a - b; });
+        tops.push(ys[1]);       // одиночная брызга не считается уровнем
+      }
+    }
+    tops.sort(function (a, b) { return a - b; });
+    return tops[tops.length >> 1];
+  }
+
+  for (var s = 0; s < 600; s++) f.step(1 / 60);
+  var lTop = surface(1.12, 2.28), rTop = surface(5.72, 6.88);
+  var delta = Math.abs(lTop - rTop);
+  var pipeVx = 0, pipeN = 0;
+  for (var i = 0; i < f.n; i++) {
+    if (f.py[i] > 3.43 && f.py[i] < 3.78 && f.px[i] > 2.1 && f.px[i] < 5.9) {
+      pipeVx += f.vx[i]; pipeN++;
+    }
+  }
+  pipeVx /= Math.max(1, pipeN);
+  ok('уровни сходятся ближе половины ряда частиц', delta < dp * 0.5,
+     'перепад ' + (delta * 100).toFixed(2) + ' см при dp=' + (dp * 100).toFixed(2) + ' см');
+  ok('после выравнивания в трубе нет постоянного течения',
+     Math.abs(pipeVx) < 0.05 && !f.hasNaN(),
+     'средняя vx ' + pipeVx.toFixed(4) + ' м/с');
 })();
 
 /* ---------- 8. тонкая стенка: нет туннелирования --------------------- */
@@ -632,7 +699,76 @@ console.log('\n[мениск: смачивает или нет]');
      '10 с: ' + lo.rise.toFixed(0) + ' мм, 40 с: ' + hi.rise.toFixed(0) + ' мм');
 })();
 
-/* ---------- 17. производительность ------------------------------------ */
+/* ---------- 17. сифон ------------------------------------------------- */
+console.log('\n[сифон: заполненный течёт, пустой не самозапускается]');
+(function () {
+  function make(primed) {
+    var W = 8, H = 4.5, cell = 0.025, dp = 0.046875;
+    var solid = new SDF.Solid(Math.ceil(W / cell), Math.ceil(H / cell), cell);
+    solid.addBorder(3);
+    solid.paintRect(0.40, 1.00, 2.70, 3.82, 1);
+    solid.paintRect(0.65, 0.80, 2.45, 3.55, 0);
+    solid.paintRect(5.00, 3.00, 7.60, 4.45, 1);
+    solid.paintRect(5.25, 2.80, 7.35, 4.20, 0);
+    solid.paintRect(1.15, 0.35, 1.85, 2.90, 1);
+    solid.paintRect(1.15, 0.35, 6.20, 1.00, 1);
+    solid.paintRect(5.50, 0.35, 6.20, 3.75, 1);
+    solid.paintRect(1.35, 0.55, 1.65, 2.96, 0);
+    solid.paintRect(1.35, 0.55, 6.00, 0.80, 0);
+    solid.paintRect(5.70, 0.55, 6.00, 3.82, 0);
+    solid.rebuild();
+    var f = new WS.Fluid({ width: W, height: H, spacing: dp,
+                           maxParticles: 10000, solid: solid });
+    function inTube(x, y) {
+      return (x > 1.35 && x < 1.65 && y > 0.55 && y < 2.96) ||
+             (x > 1.35 && x < 6.00 && y > 0.55 && y < 0.80) ||
+             (x > 5.70 && x < 6.00 && y > 0.55 && y < 3.82);
+    }
+    var dy = dp * Math.sqrt(3) / 2, row = 0;
+    for (var y = 0.5 + dp * 0.5; y < 4.2; y += dy, row++) {
+      var off = row % 2 ? dp * 0.5 : 0;
+      for (var x = 0.45 + dp * 0.5 + off; x < 7.55; x += dp) {
+        var source = x > 0.65 && x < 2.45 && y > 1.55 && y < 3.55;
+        var receiver = x > 5.25 && x < 7.35 && y > 3.92 && y < 4.20;
+        if ((source || receiver || (primed && inTube(x, y))) &&
+            solid.sample(x, y) > f.wallOffset) f.add(x, y, 0, 0, 0);
+      }
+    }
+    function countSource() {
+      var n = 0;
+      for (var i = 0; i < f.n; i++) if (f.px[i] < 2.75 && f.py[i] > 0.3) n++;
+      return n;
+    }
+    function countReceiver() {
+      var n = 0;
+      for (var i = 0; i < f.n; i++) if (f.px[i] > 5.0 && f.py[i] > 2.75) n++;
+      return n;
+    }
+    function countCrest() {
+      var n = 0;
+      for (var i = 0; i < f.n; i++)
+        if (f.py[i] > 0.53 && f.py[i] < 0.82 && f.px[i] > 1.3 && f.px[i] < 6.05) n++;
+      return n;
+    }
+    return { f: f, source: countSource, receiver: countReceiver, crest: countCrest };
+  }
+
+  var wet = make(true), ws = wet.source(), wr = wet.receiver();
+  for (var t = 0; t < 600; t++) wet.f.step(1 / 60);
+  ok('затравленный сифон переносит воду из верхнего бака',
+     wet.source() < ws - 80 && wet.receiver() > wr + 250,
+     'источник ' + (wet.source() - ws) + ', приёмник +' + (wet.receiver() - wr));
+  ok('столб воды в верхней части сифона не рвётся', wet.crest() > 300 && !wet.f.hasNaN(),
+     wet.crest() + ' частиц в верхнем участке');
+
+  var dry = make(false), ds = dry.source(), dr = dry.receiver();
+  for (t = 0; t < 300; t++) dry.f.step(1 / 60);
+  ok('пустой сифон не запускается без затравки',
+     dry.crest() === 0 && Math.abs(dry.source() - ds) <= 2 && Math.abs(dry.receiver() - dr) <= 2,
+     'источник ' + (dry.source() - ds) + ', приёмник ' + (dry.receiver() - dr));
+})();
+
+/* ---------- 18. производительность ------------------------------------ */
 console.log('\n[производительность]');
 (function () {
   var f = damResult;

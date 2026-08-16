@@ -206,7 +206,7 @@
   Fluid.arenaBytes = function (m, cells) {
     var f32 = 26 * m + 2 * m * MAXN + 2 * MAX_SLOTS * SLOT_STRIDE
             + MAX_MAT * MAT_STRIDE;
-    var i32 = 6 * m + m * MAXN + 2 * cells;
+    var i32 = 7 * m + m * MAXN + 2 * cells;
     return (f32 + i32) * 4 + 64;
   };
 
@@ -226,7 +226,12 @@
     // Подшаги при этом важнее итераций (связывают скорости с позициями).
     this.iterations = 3;
     this.substeps = 3;
-    this.relax = 3.0e-4;      // CFM-релаксация, в долях типичной суммы градиентов
+    // Мягкость ограничения плотности. При 3e-4 короткие тесты выглядели
+    // нормально, но длинная U-труба удерживала остаточный напор в несколько
+    // сантиметров: жидкость получалась заметно сжимаемой на масштабе всего
+    // контура. 1e-4 сводит уровни меньше чем до половины ряда частиц, не
+    // добавляя итераций и не меняя цену шага.
+    this.relax = 1.0e-4;      // CFM-релаксация, в долях типичной суммы градиентов
     this.sor = 1.2;           // сверхрелаксация поправки позиции (>1.4 нестабильно)
     this.maxCorrection = 0.35;// потолок поправки за итерацию, в долях dp
     /*
@@ -236,6 +241,13 @@
      * разрежается вместо того, чтобы сузиться.
      */
     this.tensionLimit = 0;
+    // Узкий заполненный канал передаёт разрежение и согласует скорость всего
+    // столба. Эти три коэффициента включают такую проекцию автоматически;
+    // пустая труба частиц не содержит и потому сама не запускается.
+    this.pipeTension = 0.06;
+    this.pipeFlow = 1.0;
+    this.pipeDrive = 1.0;
+    this.pipeDamping = 2.0;      // затухание остаточного тока у равновесия, 1/с
     this.sCorrK = 1.0e-4;     // artificial pressure
     this.sCorrDq = 0.25;      // в долях h
     this.viscosity = 0.06;    // XSPH
@@ -284,6 +296,7 @@
     this.bg = f32(m);                 // её производная по расстоянию
     this.bnx = f32(m); this.bny = f32(m);
     this.bdist = f32(m);
+    this.confined = i32(m);
     this.foam = f32(m);
     this.mat = i32(m);                // какая жидкость в этой частице
     /*
@@ -704,12 +717,16 @@
     var h = this.h, rho0 = this.rho0;
     var qx = this.qx, qy = this.qy;
     var bd = this.bd, bg = this.bg, bnx = this.bnx, bny = this.bny, bdist = this.bdist;
+    var confined = this.confined;
     var eps = h * 0.02, inv2eps = 1 / (2 * eps);
     var near = this.near, i, d;
 
     if (!solid) {
       this.nearN[slot * SLOT_STRIDE] = 0;
-      for (i = i0; i < i1; i++) { bdist[i] = 1e9; bd[i] = 0; bg[i] = 0; }
+      for (i = i0; i < i1; i++) {
+        bdist[i] = 1e9; bd[i] = 0; bg[i] = 0;
+        confined[i] = 0;
+      }
       return;
     }
     // Полный проход: заодно собираем список тех, кто вообще может достать до
@@ -720,6 +737,20 @@
     for (i = i0; i < i1; i++) {
       d = solid.sample(qx[i], qy[i]);
       bdist[i] = d;
+      confined[i] = 0;
+      // Жидкость внутри узкого канала может передавать разрежение. Ищем
+      // вторую стенку по нормали от ближайшей: у открытой поверхности бака
+      // её нет, а в трубе она находится с противоположной стороны канала.
+      var channelWidth = h * 4.0;
+      if (d < channelWidth) {
+        solid.probe(qx[i], qy[i], p);
+        for (var reach = h * 0.5; d + reach <= channelWidth; reach += h * 0.5) {
+          if (solid.sample(qx[i] + p[0] * reach, qy[i] + p[1] * reach) < this.wallOffset) {
+            confined[i] = 1;
+            break;
+          }
+        }
+      }
       if (d < slack) near[cnt++] = i;
       if (d < h) {
         solid.probe(qx[i], qy[i], p);
@@ -766,6 +797,7 @@
     this.phaseForces1(0, n);
     this.phaseForces2(0, n, dt);
     this.phaseForcesApply(0, n, dt);
+    this.projectPipeFlow(dt);
   };
 
   /* Однопоточный подшаг: те же фазы, что и в многопоточном, но на всём
@@ -852,6 +884,7 @@
     var nbr = this.nbr, ncount = this.ncount;
     var rho = this.rho, lam = this.lam;
     var bd = this.bd, bg = this.bg, bnx = this.bnx, bny = this.bny;
+    var confined = this.confined;
     var gmC = this.gmC, scC = this.scC;
     var kSpiky = this.kSpiky, k6 = this.k6, hh = this.h, hh2 = hh * hh;
     var selfW = k6 * hh2 * hh2 * hh2;
@@ -912,21 +945,34 @@
     var nbr = this.nbr, ncount = this.ncount;
     var gmC = this.gmC, scC = this.scC;
     var bg = this.bg, bnx = this.bnx, bny = this.bny;
+    var confined = this.confined, mat = this.mat;
+    var pipeTension = this.pipeTension;
+    var bondRest = this.dp * 1.08, bondMax = this.dp * 1.55;
+    var bondMax2 = bondMax * bondMax;
     var dxA = this.dx, dyA = this.dy, invRho0 = 1 / this.rho0;
     for (var i = i0; i < i1; i++) {
       var cnt = ncount[i], base = i * MAXN;
       var xi = qx[i], yi = qy[i], li = lam[i];
-      var ax = 0, ay = 0;
+      var ax = 0, ay = 0, bx = 0, by = 0;
       for (var k = 0; k < cnt; k++) {
         var gm = gmC[base + k];
         if (gm === 0) continue;
         var j = nbr[base + k];
         var c = (li + lam[j]) * gm + scC[base + k];
-        ax += c * (xi - qx[j]); ay += c * (yi - qy[j]);
+        var rx = xi - qx[j], ry = yi - qy[j];
+        ax += c * rx; ay += c * ry;
+        if (pipeTension > 0 && (confined[i] || confined[j]) && mat[i] === mat[j]) {
+          var r2 = rx * rx + ry * ry;
+          if (r2 > bondRest * bondRest && r2 < bondMax2) {
+            var r = Math.sqrt(r2);
+            var pull = pipeTension * 0.5 * (r - bondRest) / r;
+            bx -= pull * rx; by -= pull * ry;
+          }
+        }
       }
       var bg2 = bg[i];
       if (bg2 !== 0) { ax += li * bg2 * bnx[i]; ay += li * bg2 * bny[i]; }
-      dxA[i] = ax * invRho0; dyA[i] = ay * invRho0;
+      dxA[i] = ax * invRho0 + bx; dyA[i] = ay * invRho0 + by;
     }
   };
 
@@ -1193,6 +1239,209 @@
       var c = k * g * dt;
       vx[i] += sx * c; vy[i] += sy * c;
     }
+  };
+
+  /*
+   * В узкой заполненной трубе давление согласует скорость всего столба
+   * жидкости гораздо быстрее, чем локальные итерации PBF успевают передать
+   * импульс через десятки радиусов ядра. Проецируем только продольную
+   * составляющую скорости внутри каждого связного заполненного канала.
+   * Поперечное движение, вихри и вход/выход из трубы остаются у обычного
+   * решателя. Пустой канал частиц не содержит, поэтому самозапуска нет.
+   */
+  Fluid.prototype.projectPipeFlow = function (dt) {
+    var blend = this.pipeFlow;
+    if (!(blend > 0) || !this.solid || this.n === 0) return;
+    if (blend > 1) blend = 1;
+    var n = this.n, confined = this.confined;
+    var nbr = this.nbr, ncount = this.ncount;
+    var qx = this.qx, qy = this.qy, vx = this.vx, vy = this.vy;
+    var tx = this.dx, ty = this.dy;
+    var label = this.perm, queue = this.cellOf;
+    var region = this.near;
+    var solid = this.solid, p = this._probe;
+    var i, j, k;
+    for (i = 0; i < n; i++) { label[i] = -1; region[i] = -1; }
+    var anyConfined = false;
+    for (i = 0; i < n; i++) if (confined[i]) { anyConfined = true; break; }
+    if (!anyConfined) return;
+
+    // Резервуары разделяются, если мысленно вынуть воду из узких каналов.
+    // Их верхняя частица даёт уровень свободной поверхности (координата y
+    // направлена вниз). Малые отдельные брызги ниже отфильтруются по размеру.
+    var regionSurface = [], regionSize = [], regionId = 0;
+    for (var rs = 0; rs < n; rs++) {
+      if (confined[rs] || region[rs] >= 0) continue;
+      var rh = 0, rt = 1;
+      queue[0] = rs; region[rs] = regionId;
+      while (rh < rt) {
+        i = queue[rh++];
+        var rb = i * MAXN, rc = ncount[i];
+        for (k = 0; k < rc; k++) {
+          j = nbr[rb + k];
+          if (confined[j] || region[j] >= 0) continue;
+          region[j] = regionId; queue[rt++] = j;
+        }
+      }
+      regionSize[regionId] = rt;
+      regionId++;
+    }
+    // Уровень — первая широкая горизонтальная полоса компоненты. Обычный
+    // минимум y ошибочно принимал верхушку тонкой падающей струи за поверхность
+    // всего приёмного бака и почти обнулял доступный напор сифона.
+    var hist = this.scC;
+    var LEVEL_BINS = Math.min(128, Math.floor(hist.length / Math.max(1, regionId)));
+    hist.fill(0, 0, regionId * LEVEL_BINS);
+    for (i = 0; i < n; i++) {
+      var hr = region[i];
+      if (hr < 0) continue;
+      var hb = Math.floor(qy[i] / this.height * LEVEL_BINS);
+      if (hb < 0) hb = 0; else if (hb >= LEVEL_BINS) hb = LEVEL_BINS - 1;
+      hist[hr * LEVEL_BINS + hb]++;
+    }
+    for (var rr = 0; rr < regionId; rr++) {
+      var hbase = rr * LEVEL_BINS, hmax = 0;
+      for (var hbin = 0; hbin < LEVEL_BINS; hbin++)
+        if (hist[hbase + hbin] > hmax) hmax = hist[hbase + hbin];
+      var surfaceBin = 0;
+      while (surfaceBin < LEVEL_BINS - 1 && hist[hbase + surfaceBin] < hmax * 0.20)
+        surfaceBin++;
+      regionSurface[rr] = (surfaceBin + 0.5) * this.height / LEVEL_BINS;
+    }
+
+    var component = 0, largest = 0, largestU = 0, largestEnds = 0, largestHead = 0, largestDrive = 0;
+    for (var seed = 0; seed < n; seed++) {
+      if (!confined[seed] || label[seed] >= 0) continue;
+      var head = 0, tail = 1;
+      queue[0] = seed; label[seed] = component;
+      solid.probe(qx[seed], qy[seed], p);
+      tx[seed] = -p[1]; ty[seed] = p[0];
+      var sumU = 0, minPipeY = qy[seed];
+      var attachments = Object.create(null);
+
+      while (head < tail) {
+        i = queue[head++];
+        if (qy[i] < minPipeY) minPipeY = qy[i];
+        sumU += vx[i] * tx[i] + vy[i] * ty[i];
+        var base = i * MAXN, cnt = ncount[i];
+        for (k = 0; k < cnt; k++) {
+          j = nbr[base + k];
+          if (!confined[j]) {
+            var rid = region[j];
+            if (rid >= 0) {
+              var at = attachments[rid];
+              if (!at) at = attachments[rid] = { id: rid, edges: 0, orient: 0 };
+              at.edges++;
+              at.orient += tx[i] * (qx[i] - qx[j]) + ty[i] * (qy[i] - qy[j]);
+            }
+            continue;
+          }
+          if (label[j] >= 0) continue;
+          solid.probe(qx[j], qy[j], p);
+          var ux = -p[1], uy = p[0];
+          var align = ux * tx[i] + uy * ty[i];
+          if (align < 0) { ux = -ux; uy = -uy; align = -align; }
+          // В прямоугольном колене касательные ортогональны. Там знак
+          // выбираем по направлению шага графа, то есть продолжаем путь.
+          if (align < 0.2) {
+            var ex = qx[j] - qx[i], ey = qy[j] - qy[i];
+            if (ux * ex + uy * ey < 0) { ux = -ux; uy = -uy; }
+          }
+          tx[j] = ux; ty[j] = uy;
+          label[j] = component;
+          queue[tail++] = j;
+        }
+      }
+
+      // Маленькая капля между двумя стенками — ещё не гидравлический канал.
+      if (tail >= 12) {
+        var ends = [];
+        for (var aid in attachments) {
+          var ae = attachments[aid];
+          // Резервуар должен быть заметно шире самой трубы. Небольшие карманы
+          // у внутреннего радиуса колена тоже формально «не зажаты» стенками,
+          // но это часть канала, а не отдельный бак с атмосферной поверхностью.
+          if (regionSize[ae.id] >= 64) ends.push(ae);
+        }
+        if (ends.length > 2) {
+          var minEnd = ends[0], maxEnd = ends[0];
+          for (var ei = 1; ei < ends.length; ei++) {
+            if (regionSurface[ends[ei].id] < regionSurface[minEnd.id]) minEnd = ends[ei];
+            if (regionSurface[ends[ei].id] > regionSurface[maxEnd.id]) maxEnd = ends[ei];
+          }
+          ends = minEnd === maxEnd ? [minEnd] : [minEnd, maxEnd];
+        }
+        // Одна и та же открытая масса воды по обе стороны канала — обычные
+        // сообщающиеся сосуды. Их базовый PBF уже решает корректно; специальная
+        // проекция нужна только сифону между двумя отдельными резервуарами.
+        if (ends.length !== 2) { component++; continue; }
+
+        var flip = false, drive = 0, headDiff = 0;
+        if (ends.length === 2) {
+          var ea = ends[0], eb = ends[1];
+          var upper = regionSurface[ea.id] <= regionSurface[eb.id] ? ea : eb;
+          var lower = upper === ea ? eb : ea;
+          // Сифон обязан иметь участок ВЫШЕ поверхности питающего бака.
+          // Иначе это обычная щель или нижняя соединительная труба, которой
+          // достаточно базового решателя давления.
+          if (minPipeY >= regionSurface[upper.id] - this.dp * 0.5) {
+            component++;
+            continue;
+          }
+          flip = upper.orient < 0;
+          // Длина канала из площади его частиц: в типичной нарисованной
+          // трубе поперёк лежит около шести рядов. Ошибка здесь меняет лишь
+          // скорость установления потока, но не его направление и равновесие.
+          var pathLength = Math.max(this.h, tail * this.dp / 6);
+          headDiff = regionSurface[lower.id] - regionSurface[upper.id];
+          drive = this.gravityY * headDiff /
+                  pathLength * this.pipeDrive;
+        }
+        if (flip) {
+          sumU = -sumU;
+          for (k = 0; k < tail; k++) {
+            i = queue[k]; tx[i] = -tx[i]; ty[i] = -ty[i];
+          }
+        }
+        // Вдали от равновесия потери уже возникают в обычном PBF и у стен.
+        // Дополнительное затухание нужно только когда напор меньше двух h:
+        // оно убирает численный вечный ток, не тормозя работающий сифон.
+        var pipeLoss = headDiff < this.h * 0.6 ? this.pipeDamping : 0;
+        var common = sumU / tail * Math.exp(-pipeLoss * dt) + drive * dt;
+        if (tail > largest) {
+          largest = tail; largestU = common; largestEnds = ends.length;
+          largestHead = headDiff; largestDrive = drive;
+        }
+        for (k = 0; k < tail; k++) {
+          i = queue[k];
+          var along = vx[i] * tx[i] + vy[i] * ty[i];
+          var du = (common - along) * blend;
+          vx[i] += tx[i] * du; vy[i] += ty[i] * du;
+        }
+        // Один слой жидкости у открытого конца получает ту же продольную
+        // скорость. Иначе частица становится «трубной» лишь на следующем
+        // шаге, а за этот кадр на входе успевает открыться кавитационный зазор.
+        for (k = 0; k < tail; k++) {
+          i = queue[k];
+          var base2 = i * MAXN, cnt2 = ncount[i];
+          for (var e = 0; e < cnt2; e++) {
+            j = nbr[base2 + e];
+            if (confined[j] || label[j] !== -1) continue;
+            label[j] = -2;
+            var haloAlong = vx[j] * tx[i] + vy[j] * ty[i];
+            var haloDu = (common - haloAlong) * blend * 0.75;
+            vx[j] += tx[i] * haloDu; vy[j] += ty[i] * haloDu;
+          }
+        }
+      }
+      component++;
+    }
+    this.stats.pipeComponents = component;
+    this.stats.pipeLargest = largest;
+    this.stats.pipeSpeed = largestU;
+    this.stats.pipeEnds = largestEnds;
+    this.stats.pipeHead = largestHead;
+    this.stats.pipeDrive = largestDrive;
   };
 
   /*

@@ -8,7 +8,7 @@
 (function () {
   'use strict';
 
-  var APP_VERSION = '7';        // сбивает кэш воркеров при правках
+  var APP_VERSION = '8';        // сбивает кэш воркеров при правках
   var CW = 1280, CH = 720;
   var WORLD_W = 8.0, WORLD_H = 4.5;
   var PX_PER_M = CW / WORLD_W;
@@ -27,6 +27,7 @@
 
   var app = {
     quality: 'medium',
+    graphics: 'simple',
     paused: false,
     tool: 'wall',
     material: 0,        // чем льём: 0 вода, 1 масло, 2 пиво, 3 ртуть
@@ -38,6 +39,7 @@
     time: 0,
     maxLive: 26000, throttled: false,
     pool: null, threads: 1, parReason: null, snap: null, view: null,
+    pendingPrime: null,
     physMs: 8, renderMs: 4, fps: 60, steps: 1,
     render: {
       tankDepth: 2.4, absorb: 1.0, scatter: 1.0, refract: 22, height: 1.6,
@@ -234,6 +236,7 @@
     mouse.x = mouse.px = w.x; mouse.y = mouse.py = w.y;
     mouse.down = true; mouse.button = e.button; mouse.moved = true;
     if (app.tool === 'tap') { app.emitter.x = w.x; app.emitter.y = w.y; }
+    else if (app.tool === 'prime' && e.button === 0) app.pendingPrime = { x: w.x, y: w.y };
     e.preventDefault();
   });
 
@@ -254,6 +257,7 @@
     else if (k === '3') setTool('water');
     else if (k === '4') setTool('tap');
     else if (k === '5') setTool('push');
+    else if (k === '6') setTool('prime');
     else if (k === ' ') { app.paused = !app.paused; syncUI(); e.preventDefault(); }
     else if (k === 'c') { app.fluid.clear(); app.diffuse.clear(); }
     else if (k === 'x') { loadScene('empty', false); }
@@ -306,6 +310,78 @@
     }
   }
 
+  /*
+   * Затравка сифона. По гексагональной решётке обходим связную часть узкого
+   * канала, в которой точка действительно находится между двумя стенками,
+   * и заполняем её выбранной жидкостью. Широкие открытые баки в обход не
+   * попадают, поэтому один клик не заливает всю сцену.
+   */
+  function primeSiphon(cx, cy) {
+    var f = app.fluid, s = app.solid, dp = f.dp;
+    var dy = dp * Math.sqrt(3) / 2;
+    var nx = Math.ceil(WORLD_W / dp) + 2, ny = Math.ceil(WORLD_H / dy) + 2;
+    var total = nx * ny, seen = new Uint8Array(total), queue = new Int32Array(total);
+    var probe = [0, 0], maxWidth = f.h * 4.0;
+
+    function point(row, col) {
+      return [(col + 0.5 + (row & 1) * 0.5) * dp, (row + 0.5) * dy];
+    }
+    function narrow(x, y) {
+      if (x <= 0 || x >= WORLD_W || y <= 0 || y >= WORLD_H) return false;
+      var d = s.sample(x, y);
+      if (d < f.wallOffset || d >= maxWidth) return false;
+      s.probe(x, y, probe);
+      for (var reach = f.h * 0.5; d + reach <= maxWidth; reach += f.h * 0.5)
+        if (s.sample(x + probe[0] * reach, y + probe[1] * reach) < f.wallOffset) return true;
+      return false;
+    }
+
+    // Ближайший узкий узел, но только в пределах небольшого радиуса клика.
+    var row0 = Math.round(cy / dy - 0.5), col0 = Math.round(cx / dp - 0.5 - (row0 & 1) * 0.5);
+    var start = -1, best = f.h * f.h * 6.25;
+    for (var rr = Math.max(0, row0 - 4); rr <= Math.min(ny - 1, row0 + 4); rr++) {
+      for (var cc = Math.max(0, col0 - 4); cc <= Math.min(nx - 1, col0 + 4); cc++) {
+        var pp = point(rr, cc), ddx = pp[0] - cx, ddy = pp[1] - cy;
+        var d2 = ddx * ddx + ddy * ddy;
+        if (d2 < best && narrow(pp[0], pp[1])) { best = d2; start = rr * nx + cc; }
+      }
+    }
+    if (start < 0) {
+      note('Нажмите внутри узкой трубки сифона');
+      return;
+    }
+
+    var head = 0, tail = 1; queue[0] = start; seen[start] = 1;
+    var dirs = [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1],
+                [1, -1], [1, 0], [1, 1]];
+    while (head < tail) {
+      var id = queue[head++], row = Math.floor(id / nx), col = id - row * nx;
+      var pa = point(row, col);
+      for (var di = 0; di < dirs.length; di++) {
+        var nr = row + dirs[di][0], nc = col + dirs[di][1];
+        if (nr < 0 || nr >= ny || nc < 0 || nc >= nx) continue;
+        var ni = nr * nx + nc;
+        if (seen[ni]) continue;
+        var pb = point(nr, nc);
+        if (!narrow(pb[0], pb[1])) continue;
+        if (s.sample((pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5) < f.wallOffset) continue;
+        seen[ni] = 1; queue[tail++] = ni;
+      }
+    }
+
+    var added = 0;
+    for (var qi = 0; qi < tail && f.n < app.maxLive; qi++) {
+      var qid = queue[qi], qr = Math.floor(qid / nx), qc = qid - qr * nx;
+      var q = point(qr, qc);
+      if (f.hasParticleNear(q[0], q[1], dp * 0.82)) continue;
+      f.add(q[0], q[1], 0, 0, app.material); added++;
+    }
+    if (added) {
+      app.diffuse.clear();
+      note('Сифон затравлен: добавлено ' + added + ' частиц');
+    } else note('Эта трубка уже заполнена');
+  }
+
   /* ------------------------------------------------------------------ */
   /* Цикл                                                                */
 
@@ -326,6 +402,10 @@
       if (killed) app.diffuse.clear();
       if (app.renderer.ok) app.renderer.uploadSdf(app.solid);
       wallDirty = false;
+    }
+    if (app.pendingPrime) {
+      primeSiphon(app.pendingPrime.x, app.pendingPrime.y);
+      app.pendingPrime = null;
     }
     applyTool(dt);
     if (!app.paused) {
@@ -447,7 +527,10 @@
     var t1 = performance.now();
     app.render.time = app.time;
     var view = app.view || app.fluid;
-    if (app.renderer.ok) app.renderer.draw(view, app.diffuse, app.render);
+    if (app.renderer.ok) {
+      if (app.graphics === 'simple') app.renderer.drawSimple(view);
+      else app.renderer.draw(view, app.diffuse, app.render);
+    }
     else app.fallback(view, app.diffuse);
     drawCursor();
     renderEma += (performance.now() - t1 - renderEma) * 0.1;
@@ -473,6 +556,12 @@
       curCtx.lineWidth = 2;
       curCtx.beginPath(); curCtx.arc(x, y, 12, 0, 6.284); curCtx.stroke();
       curCtx.beginPath(); curCtx.moveTo(x, y + 12); curCtx.lineTo(x, y + 34); curCtx.stroke();
+    } else if (app.tool === 'prime') {
+      curCtx.strokeStyle = 'rgba(110,225,255,0.95)';
+      curCtx.lineWidth = 2;
+      curCtx.beginPath(); curCtx.arc(x, y, 10, 0, 6.284); curCtx.stroke();
+      curCtx.beginPath(); curCtx.moveTo(x - 14, y); curCtx.lineTo(x + 14, y);
+      curCtx.moveTo(x, y - 14); curCtx.lineTo(x, y + 14); curCtx.stroke();
     } else {
       var r = app.brush * (app.tool === 'push' ? 1.6 : 1);
       curCtx.strokeStyle = app.tool === 'wall' ? 'rgba(255,190,120,0.85)'
@@ -650,6 +739,8 @@
     $('btnPause').textContent = app.paused ? '► Пуск' : '❚❚ Пауза';
     $('btnTap').classList.toggle('on', app.emitter.on);
     $('quality').value = app.quality;
+    $('graphics').value = app.graphics;
+    document.body.classList.toggle('simple-render', app.graphics === 'simple');
     var th = $('threads');
     th.value = String(app.threadsWanted || 3);
     th.disabled = !!app.parReason;
@@ -664,7 +755,9 @@
     var s = app.fluid.n + ' частиц · ' + app.diffuse.n + ' брызг · ' +
       app.fps.toFixed(0) + ' fps · шаг ' + app.physMs.toFixed(1) + ' мс' +
       (app.steps > 1 ? ' ×' + app.steps : '') +
-      ' · ' + (app.threads > 1 ? app.threads + ' потока' : '1 поток');
+      ' · рендер ' + app.renderMs.toFixed(1) + ' мс' +
+      ' · ' + (app.threads > 1 ? app.threads + ' потока' : '1 поток') +
+      (app.graphics === 'simple' ? ' · просто' : ' · красиво');
     if (app.speed !== 1) s += ' · скорость ×' + app.speed.toFixed(2);
     if (app.throttled) s += ' · кран приостановлен (нагрузка)';
     else if (app.fluid.n >= app.maxLive) s += ' · предел ' + app.maxLive;
@@ -701,6 +794,10 @@
     $('quality').addEventListener('change', function () {
       app.quality = this.value;
       build(true);
+    });
+    $('graphics').addEventListener('change', function () {
+      app.graphics = this.value;
+      syncUI();
     });
     $('threads').addEventListener('change', function () {
       app.threadsWanted = +this.value;

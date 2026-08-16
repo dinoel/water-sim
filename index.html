@@ -43,6 +43,7 @@
   }
   #ui::-webkit-scrollbar { width: 7px; }
   #ui::-webkit-scrollbar-thumb { background: rgba(255,255,255,.13); border-radius: 4px; }
+  body.simple-render #renderControls { display: none; }
 
   h1 { font-size: 12px; margin: 0 0 10px; letter-spacing: .09em;
        text-transform: uppercase; color: var(--dim); font-weight: 600; }
@@ -139,6 +140,7 @@
         <button data-tool="water">Налить <kbd>3</kbd></button>
         <button data-tool="tap">Кран <kbd>4</kbd></button>
         <button data-tool="push">Толкать <kbd>5</kbd></button>
+        <button data-tool="prime">Сифон <kbd>6</kbd></button>
         <button id="btnHelp">Справка</button>
       </div>
       <h2>Жидкость <span id="matNote"></span></h2>
@@ -192,6 +194,12 @@
           <option value="high">Высокое — мелкие частицы</option>
         </select>
       </label>
+      <label style="margin-top:9px">Графика
+        <select id="graphics">
+          <option value="simple" selected>Просто — только физика</option>
+          <option value="pretty">Красиво — полный рендер</option>
+        </select>
+      </label>
 
       <h2>Физика</h2>
       <label>Гравитация, м/с² <span id="sGravv">9.81</span>
@@ -221,6 +229,7 @@
       <label>Диаметр струи, м <span id="sWidev">0.26</span>
         <input type="range" id="sWide" min="0.04" max="1.2" step="0.01"></label>
 
+      <div id="renderControls">
       <h2>Вид воды</h2>
       <label>Толщина бака, м <span id="sDepthv">1.10</span>
         <input type="range" id="sDepth" min="0.05" max="4" step="0.05"></label>
@@ -259,6 +268,7 @@
         <input type="range" id="sBloom" min="0" max="2.5" step="0.05"></label>
       <label>Виньетка <span id="sVignv">0.70</span>
         <input type="range" id="sVign" min="0" max="1.5" step="0.05"></label>
+      </div>
     </div>
 
     <div id="stats">—</div>
@@ -295,12 +305,15 @@
           <tr><td>Толкать</td><td>тащит воду за курсором — как провести
             рукой сквозь неё. Вода прилипает к движущемуся телу, поэтому
             <b>неподвижный курсор наоборот тормозит поток</b>, работая
-            преградой. Сила и радиус настраиваются.</td></tr>
+             преградой. Сила и радиус настраиваются.</td></tr>
+          <tr><td>Сифон</td><td>заполняет выбранной жидкостью узкий канал,
+            на который вы нажали. Сифон надо затравить: пустая трубка сама
+            воду через верх не поднимет.</td></tr>
         </table>
 
         <h3 style="margin-top:18px">Клавиши</h3>
         <table>
-          <tr><td>1 … 5</td><td>инструменты</td></tr>
+          <tr><td>1 … 6</td><td>инструменты</td></tr>
           <tr><td>Пробел</td><td>пауза</td></tr>
           <tr><td>C / X</td><td>слить воду / стереть стены</td></tr>
           <tr><td>F</td><td>кран вкл-выкл</td></tr>
