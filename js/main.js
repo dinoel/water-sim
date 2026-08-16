@@ -31,14 +31,15 @@
     paused: false,
     tool: 'wall',
     material: 0,        // чем льём: 0 вода, 1 масло, 2 пиво, 3 ртуть
-    speed: 1.0,         // скорость симуляции: 1 = реальное время
+    speed: 1.0,         // скорость времени: 1 = реальное время
     brush: 26,          // пиксели
     stirStrength: 0.5,  // насколько сильно вода липнет к курсору
     solid: null, fluid: null, diffuse: null, emitter: null, renderer: null,
     fallback: null,
     time: 0,
     maxLive: 26000, throttled: false,
-    pool: null, threads: 1, parReason: null, snap: null, view: null,
+    pool: null, threads: 1, parReason: null, snap: null, timeView: null,
+    diffuseView: null, view: null,
     pendingPrime: null,
     physMs: 8, renderMs: 4, fps: 60, steps: 1,
     render: {
@@ -97,6 +98,8 @@
     app.snap = { px: new Float32Array(MAXP), py: new Float32Array(MAXP),
                  vx: new Float32Array(MAXP), vy: new Float32Array(MAXP),
                  foam: new Float32Array(MAXP), mat: new Int32Array(MAXP), n: 0 };
+    app.timeView = { px: new Float32Array(MAXP), py: new Float32Array(MAXP), n: 0 };
+    app.diffuseView = { px: new Float32Array(14000), py: new Float32Array(14000), n: 0 };
     startPool(fluid, solid);
 
     if (!app.renderer) {
@@ -249,6 +252,7 @@
       else if (name === 'siphon') fillSiphonScene();
       else app.fluid.fillRect(0.3, 3.3, WORLD_W - 0.3, 4.4, 0.02);
     }
+    if (!app.pool || !app.pool.busy) snapshot();
   }
 
   /* ------------------------------------------------------------------ */
@@ -318,6 +322,10 @@
     } else if (tool === 'water') {
       pourWater(mouse.x, mouse.y, br);
     } else if (tool === 'push') {
+      // На кадре без продвижения физического времени стены и воду всё ещё
+      // можно редактировать, но скорость движения курсора делить на ноль
+      // нельзя. Толчок применится вместе со следующим шагом физики.
+      if (!(dt > 0)) { mouse.px = mouse.x; mouse.py = mouse.y; return; }
       // скорость курсора в м/с — её и «прилипает» вода вокруг
       var cvx = (mouse.x - mouse.px) / dt, cvy = (mouse.y - mouse.py) / dt;
       var sp = Math.sqrt(cvx * cvx + cvy * cvy);
@@ -424,6 +432,7 @@
   var DT = 1 / 60;
   var MAX_STEPS = 4;            // потолок шагов физики на кадр
   var acc = 0, last = performance.now();
+  var inFlightDt = 0;
   var stepsThisFrame = 0;
   var physEma = 8, renderEma = 4, fpsEma = 60, overFrames = 0;
 
@@ -444,7 +453,7 @@
       app.pendingPrime = null;
     }
     applyTool(dt);
-    if (!app.paused) {
+    if (!app.paused && dt > 0) {
       if (!app.throttled && app.fluid.n < app.maxLive) app.emitter.step(dt);
       app.diffuse.step(dt);
     }
@@ -462,6 +471,39 @@
   }
 
   /*
+   * При замедлении физика по-прежнему решается устойчивыми шагами 1/60,
+   * но между ними изображение не должно замирать. Экстраполируем только
+   * представление для рендера на ещё не прожитый остаток шага. Сам решатель
+   * и его массивы не трогаем: следующий точный шаг мягко подхватывает кадр.
+   */
+  function timeView(base, lead) {
+    var v = app.timeView, n = base.n, half = 0.5 * lead * lead;
+    var gx = app.fluid.gravityX, gy = app.fluid.gravityY;
+    for (var i = 0; i < n; i++) {
+      v.px[i] = base.px[i] + base.vx[i] * lead + gx * half;
+      v.py[i] = base.py[i] + base.vy[i] * lead + gy * half;
+    }
+    v.vx = base.vx; v.vy = base.vy;
+    v.foam = base.foam; v.mat = base.mat;
+    v.n = n; v.dp = base.dp;
+    return v;
+  }
+
+  function timeDiffuse(base, lead) {
+    if (!(lead > 0)) return base;
+    var v = app.diffuseView, n = base.n, halfG = 0.5 * app.fluid.gravityY * lead * lead;
+    for (var i = 0; i < n; i++) {
+      v.px[i] = base.px[i] + base.vx[i] * lead;
+      v.py[i] = base.py[i] + base.vy[i] * lead + (base.type[i] === 0 ? halfG : 0);
+    }
+    v.vx = base.vx; v.vy = base.vy;
+    v.life = base.life; v.life0 = base.life0;
+    v.type = base.type; v.size = base.size; v.mat = base.mat;
+    v.n = n;
+    return v;
+  }
+
+  /*
    * Длительность шага берём из замера внутри рабочего потока, а не по
    * времени до сообщения «готово»: сообщение ждёт, пока главный поток
    * освободится от отрисовки, и приписало бы физике чужое время.
@@ -472,13 +514,15 @@
    * раз в кадр, то есть не быстрее 60 шагов в секунду.
    */
   function onPhysicsDone() {
+    app.time += inFlightDt;
+    inFlightDt = 0;
     var real = app.pool ? app.pool.times[2] : 0;
     if (!(real > 0)) real = performance.now() - app.physT0;
     physEma += (real - physEma) * 0.1;
     if (!app.paused && acc >= DT && stepsThisFrame < MAX_STEPS) {
       idleWindow(DT);
       startStep();
-    }
+    } else snapshot();
   }
 
   /* Запустить один шаг физики в пуле. Окно простоя вызывает вызывающий. */
@@ -487,11 +531,11 @@
     if (!pool || !pool.ready || pool.busy) return false;
     if (app.paused || acc < DT) return false;
     snapshot();
-    app.time += DT;
     acc -= DT;
     stepsThisFrame++;
     app.steps = stepsThisFrame;
     app.physT0 = performance.now();
+    inFlightDt = DT;
     pool.step(DT);
     return true;
   }
@@ -502,34 +546,32 @@
     last = now;
     fpsEma += (1 / Math.max(real, 1e-4) - fpsEma) * 0.06;
 
-    /*
-     * Скорость симуляции масштабирует НЕ шаг по времени, а то, сколько его
-     * проживает кадр. Шаг остаётся 1/60: под него выверены подшаги и число
-     * итераций, и растягивать его — значит выводить решатель из области
-     * устойчивости. Замедление при таком способе точное: те же вычисления,
-     * просто реже. Ускорение упирается в потолок шагов на кадр и в саму
-     * машину — быстрее, чем она считает, симуляция не пойдёт.
-     */
+    // Ползунок масштабирует именно течение модельного времени. Физический
+    // шаг остаётся 1/60 ради устойчивости, а плавность замедления даёт
+    // промежуточное представление timeView перед отрисовкой.
     var simDt = app.paused ? 0 : real * app.speed;
     stepsThisFrame = 0;
+    app.steps = 0;
 
     var pool = app.pool;
     if (pool && pool.ready) {
       // --- многопоточно: главный поток только раздаёт работу и рисует ---
       acc += simDt;
       if (acc > DT * MAX_STEPS) acc = DT * MAX_STEPS;   // не копим долг
-      if (!pool.busy) { idleWindow(DT); startStep(); }
+      if (!pool.busy) {
+        if (acc >= DT) { idleWindow(DT); startStep(); }
+        else { idleWindow(0); snapshot(); }
+      }
       app.view = app.snap;
     } else {
       // --- один поток: считаем прямо здесь ---
       var t0 = performance.now();
-      idleWindow(DT);
       if (!app.paused) {
         acc += simDt;
         // потолок шагов: иначе после переключения вкладки один длинный кадр
         // вызывает лавину шагов, которая делает следующий кадр ещё длиннее
         while (acc >= DT && stepsThisFrame < MAX_STEPS) {
-          if (stepsThisFrame > 0) idleWindow(DT);
+          idleWindow(DT);
           app.fluid.step(DT);
           app.time += DT;
           acc -= DT; stepsThisFrame++;
@@ -537,13 +579,15 @@
         if (acc > DT * MAX_STEPS) acc = 0;
         app.steps = Math.max(1, stepsThisFrame);
       }
+      if (stepsThisFrame === 0) idleWindow(0);
       /*
        * Делим на число шагов: physEma всюду означает время ОДНОГО шага. Без
        * этого при ускоренной симуляции регулятор видел бы втрое большее
        * число, считал физику перегруженной и закрывал кран — хотя нагрузка
        * на шаг не изменилась.
        */
-      physEma += ((performance.now() - t0) / Math.max(1, stepsThisFrame) - physEma) * 0.1;
+      if (stepsThisFrame > 0)
+        physEma += ((performance.now() - t0) / stepsThisFrame - physEma) * 0.1;
       app.view = app.fluid;
     }
 
@@ -561,13 +605,25 @@
     app.throttled = overFrames > 40;
 
     var t1 = performance.now();
-    app.render.time = app.time;
     var view = app.view || app.fluid;
+    var renderLead = app.speed < 1
+      ? Math.min(DT, acc + ((pool && pool.ready && pool.busy) ? inFlightDt : 0))
+      : 0;
+    var diffuse = app.diffuse;
+    if (renderLead > 0) {
+      view = timeView(view, renderLead);
+      // В многопоточном шаге diffuse уже продвинут на inFlightDt перед
+      // запуском воркеров. Предсказываем только оставшийся хвост времени.
+      var diffuseLead = (pool && pool.ready && pool.busy)
+        ? Math.max(0, renderLead - inFlightDt) : renderLead;
+      diffuse = timeDiffuse(diffuse, diffuseLead);
+    }
+    app.render.time = app.time + renderLead;
     if (app.renderer.ok) {
       if (app.graphics === 'simple') app.renderer.drawSimple(view);
-      else app.renderer.draw(view, app.diffuse, app.render);
+      else app.renderer.draw(view, diffuse, app.render);
     }
-    else app.fallback(view, app.diffuse);
+    else app.fallback(view, diffuse);
     drawCursor();
     renderEma += (performance.now() - t1 - renderEma) * 0.1;
 
