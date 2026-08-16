@@ -200,8 +200,43 @@
     // Плотина: перегородка, слева налита вода
     dam: function (s) {
       s.paintRect(3.05, 0.9, 3.25, 4.2, 1);
+    },
+
+    // Готовый сифон: верхний бак, нижний приёмник и узкая U-трубка.
+    // Жидкость добавляется отдельно после перестроения SDF, чтобы трубка
+    // загружалась уже затравленной и сразу начинала перекачивать воду.
+    siphon: function (s) {
+      s.paintRect(0.40, 1.00, 2.70, 3.82, 1);
+      s.paintRect(0.65, 0.80, 2.45, 3.55, 0);
+
+      s.paintRect(5.00, 3.00, 7.60, 4.45, 1);
+      s.paintRect(5.25, 2.80, 7.35, 4.20, 0);
+
+      s.paintRect(1.15, 0.35, 1.85, 2.90, 1);
+      s.paintRect(1.15, 0.35, 6.20, 1.00, 1);
+      s.paintRect(5.50, 0.35, 6.20, 3.75, 1);
+      s.paintRect(1.35, 0.55, 1.65, 2.96, 0);
+      s.paintRect(1.35, 0.55, 6.00, 0.80, 0);
+      s.paintRect(5.70, 0.55, 6.00, 3.82, 0);
     }
   };
+
+  function fillSiphonScene() {
+    var f = app.fluid, dp = f.dp, dy = dp * Math.sqrt(3) * 0.5;
+    var row = 0;
+    for (var y = 0.5 + dp * 0.5; y < 4.2; y += dy, row++) {
+      var off = row % 2 ? dp * 0.5 : 0;
+      for (var x = 0.45 + dp * 0.5 + off; x < 7.55; x += dp) {
+        var source = x > 0.65 && x < 2.45 && y > 1.55 && y < 3.55;
+        var receiver = x > 5.25 && x < 7.35 && y > 3.92 && y < 4.20;
+        var tube = (x > 1.35 && x < 1.65 && y > 0.55 && y < 2.96) ||
+          (x > 1.35 && x < 6.00 && y > 0.55 && y < 0.80) ||
+          (x > 5.70 && x < 6.00 && y > 0.55 && y < 3.82);
+        if ((source || receiver || tube) && f.solid.sample(x, y) > f.wallOffset)
+          f.add(x, y, 0, 0, 0);
+      }
+    }
+  }
 
   function loadScene(name, withWater) {
     app.solid.clear(true, 3);
@@ -211,6 +246,7 @@
     if (app.renderer.ok) app.renderer.uploadSdf(app.solid);
     if (withWater) {
       if (name === 'dam') app.fluid.fillRect(0.2, 1.35, 2.95, 4.4, 0.02);
+      else if (name === 'siphon') fillSiphonScene();
       else app.fluid.fillRect(0.3, 3.3, WORLD_W - 0.3, 4.4, 0.02);
     }
   }
