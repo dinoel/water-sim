@@ -242,6 +242,7 @@
   }
 
   function loadScene(name, withWater) {
+    pendingPour = null;
     app.solid.clear(true, 3);
     scenes[name](app.solid);
     app.solid.rebuild();
@@ -277,6 +278,8 @@
     mouse.down = true; mouse.button = e.button; mouse.moved = true;
     if (app.tool === 'tap') { app.emitter.x = w.x; app.emitter.y = w.y; }
     else if (app.tool === 'prime' && e.button === 0) app.pendingPrime = { x: w.x, y: w.y };
+    else if (app.tool === 'water' && e.button === 0)
+      pendingPour = { x: w.x, y: w.y, r: app.brush / PX_PER_M, mat: app.material };
     e.preventDefault();
   });
 
@@ -284,6 +287,8 @@
     var w = toWorld(e);
     mouse.x = w.x; mouse.y = w.y; mouse.inside = true; mouse.moved = true;
     if (mouse.down && app.tool === 'tap') { app.emitter.x = w.x; app.emitter.y = w.y; }
+    else if (mouse.down && mouse.button === 0 && app.tool === 'water')
+      pendingPour = { x: w.x, y: w.y, r: app.brush / PX_PER_M, mat: app.material };
   });
 
   window.addEventListener('pointerup', function () { mouse.down = false; });
@@ -308,6 +313,7 @@
   });
 
   var wallDirty = false;
+  var pendingPour = null;
 
   function applyTool(dt) {
     if (!mouse.down) return;
@@ -316,16 +322,27 @@
     var tool = app.tool;
     if (mouse.button === 2 && (tool === 'wall' || tool === 'water')) tool = 'erase';
 
+    // Стены и ластик — геометрическое редактирование, оно работает на
+    // каждом экранном кадре. Вода и толчок меняют динамическое состояние и
+    // потому выполняются только вместе с шагом модельного времени. Иначе на
+    // 0.05x кисть двадцать раз набивала неподвижную каплю до следующего шага,
+    // после чего проекция плотности разбрасывала её как взрыв.
+    if (!(dt > 0) && tool === 'water') {
+      pendingPour = { x: mouse.x, y: mouse.y, r: br, mat: app.material };
+      mouse.px = mouse.x; mouse.py = mouse.y;
+      return;
+    }
+    if (!(dt > 0) && tool === 'push') {
+      mouse.px = mouse.x; mouse.py = mouse.y;
+      return;
+    }
+
     if (tool === 'wall' || tool === 'erase') {
       var v = tool === 'wall' ? 1 : 0;
       if (s.paintSegment(mouse.px, mouse.py, mouse.x, mouse.y, br, v)) wallDirty = true;
     } else if (tool === 'water') {
       pourWater(mouse.x, mouse.y, br);
     } else if (tool === 'push') {
-      // На кадре без продвижения физического времени стены и воду всё ещё
-      // можно редактировать, но скорость движения курсора делить на ноль
-      // нельзя. Толчок применится вместе со следующим шагом физики.
-      if (!(dt > 0)) { mouse.px = mouse.x; mouse.py = mouse.y; return; }
       // скорость курсора в м/с — её и «прилипает» вода вокруг
       var cvx = (mouse.x - mouse.px) / dt, cvy = (mouse.y - mouse.py) / dt;
       var sp = Math.sqrt(cvx * cvx + cvy * cvy);
@@ -338,8 +355,9 @@
 
   /* Наливаем воду кистью: гексагональная упаковка + проверка на занятость,
    * чтобы новые частицы не рождались внутри существующих. */
-  function pourWater(cx, cy, r) {
+  function pourWater(cx, cy, r, mat) {
     var f = app.fluid, dp = f.dp, dy = dp * Math.sqrt(3) / 2;
+    if (mat === undefined) mat = app.material;
     var rows = Math.ceil(r / dy);
     for (var j = -rows; j <= rows; j++) {
       var y = cy + j * dy;
@@ -349,7 +367,7 @@
         if (f.n >= app.maxLive) return;
         if (f.solid.sample(x, y) < f.wallOffset) continue;
         if (f.hasParticleNear(x, y, dp * 0.85)) continue;
-        f.add(x, y, 0, 0.3, app.material);
+        f.add(x, y, 0, 0.3, mat);
       }
     }
   }
@@ -451,6 +469,10 @@
     if (app.pendingPrime) {
       primeSiphon(app.pendingPrime.x, app.pendingPrime.y);
       app.pendingPrime = null;
+    }
+    if (dt > 0 && pendingPour) {
+      pourWater(pendingPour.x, pendingPour.y, pendingPour.r, pendingPour.mat);
+      pendingPour = null;
     }
     applyTool(dt);
     if (!app.paused && dt > 0) {
