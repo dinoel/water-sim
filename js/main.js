@@ -322,16 +322,9 @@
     var tool = app.tool;
     if (mouse.button === 2 && (tool === 'wall' || tool === 'water')) tool = 'erase';
 
-    // Стены и ластик — геометрическое редактирование, оно работает на
-    // каждом экранном кадре. Вода и толчок меняют динамическое состояние и
-    // потому выполняются только вместе с шагом модельного времени. Иначе на
-    // 0.05x кисть двадцать раз набивала неподвижную каплю до следующего шага,
-    // после чего проекция плотности разбрасывала её как взрыв.
-    if (!(dt > 0) && tool === 'water') {
-      pendingPour = { x: mouse.x, y: mouse.y, r: br, mat: app.material };
-      mouse.px = mouse.x; mouse.py = mouse.y;
-      return;
-    }
+    // Стены, ластик и наливание должны отзываться сразу даже в замедлении.
+    // Толчок задаёт скорость в м/с, поэтому применяется только на такте
+    // модельного времени — иначе пришлось бы делить движение мыши на ноль.
     if (!(dt > 0) && tool === 'push') {
       mouse.px = mouse.x; mouse.py = mouse.y;
       return;
@@ -353,20 +346,32 @@
     mouse.px = mouse.x; mouse.py = mouse.y;
   }
 
-  /* Наливаем воду кистью: гексагональная упаковка + проверка на занятость,
-   * чтобы новые частицы не рождались внутри существующих. */
+  /*
+   * Наливаем на ОДНОЙ глобальной гексагональной решётке. Раньше каждая
+   * позиция мыши строила свою решётку от центра кисти. При 0.05x между двумя
+   * шагами физики успевало пройти много таких мазков, их узлы сдвигались друг
+   * относительно друга и набивали каплю плотнее равновесия. Следующая
+   * проекция плотности раздвигала её взрывом. Глобальные узлы совпадают у
+   * всех мазков, поэтому повторный кадр может добавить только пустые места.
+   */
   function pourWater(cx, cy, r, mat) {
     var f = app.fluid, dp = f.dp, dy = dp * Math.sqrt(3) / 2;
     if (mat === undefined) mat = app.material;
-    var rows = Math.ceil(r / dy);
-    for (var j = -rows; j <= rows; j++) {
-      var y = cy + j * dy;
-      var half = Math.sqrt(Math.max(0, r * r - (j * dy) * (j * dy)));
-      var off = (Math.abs(j) % 2) ? dp * 0.5 : 0;
-      for (var x = cx - half + off; x <= cx + half; x += dp) {
+    var row0 = Math.floor((cy - r) / dy) - 1;
+    var row1 = Math.ceil((cy + r) / dy) + 1;
+    for (var row = row0; row <= row1; row++) {
+      var y = (row + 0.5) * dy;
+      var yy = y - cy;
+      if (Math.abs(yy) > r) continue;
+      var half = Math.sqrt(Math.max(0, r * r - yy * yy));
+      var off = (row & 1) ? dp * 0.5 : 0;
+      var col0 = Math.ceil((cx - half - off) / dp - 0.5);
+      var col1 = Math.floor((cx + half - off) / dp - 0.5);
+      for (var col = col0; col <= col1; col++) {
+        var x = (col + 0.5) * dp + off;
         if (f.n >= app.maxLive) return;
         if (f.solid.sample(x, y) < f.wallOffset) continue;
-        if (f.hasParticleNear(x, y, dp * 0.85)) continue;
+        if (f.hasParticleNear(x, y, dp * 0.95)) continue;
         f.add(x, y, 0, 0.3, mat);
       }
     }
@@ -470,7 +475,7 @@
       primeSiphon(app.pendingPrime.x, app.pendingPrime.y);
       app.pendingPrime = null;
     }
-    if (dt > 0 && pendingPour) {
+    if (pendingPour) {
       pourWater(pendingPour.x, pendingPour.y, pendingPour.r, pendingPour.mat);
       pendingPour = null;
     }
